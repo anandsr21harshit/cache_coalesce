@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cache Coalescing Demo</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: .25rem; }
+    .subtle { opacity: .72; margin-top: 0; }
+    .controls { display: flex; flex-wrap: wrap; gap: .75rem; margin: 1.5rem 0; }
+    button { padding: .7rem 1rem; border: 0; border-radius: .45rem; cursor: pointer; font: inherit; }
+    button:disabled { opacity: .55; cursor: wait; }
+    .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: .75rem; }
+    .card { padding: 1rem; border: 1px solid #8886; border-radius: .6rem; }
+    .value { display: block; font-size: 1.8rem; font-weight: 700; }
+    .chart { margin-top: 1.5rem; padding: 1rem; border: 1px solid #8886; border-radius: .6rem; }
+    canvas { width: 100%; height: 280px; display: block; }
+    #message { min-height: 1.5rem; }
+  </style>
+</head>
+<body>
+  <h1>Cache request coalescing</h1>
+  <p class="subtle">Compare database reads during a 1,000-caller cold-key burst. Database loads count repository reads; H2 itself is in-memory.</p>
+  <div class="controls">
+    <button id="fetch">Fetch item once</button>
+    <button id="coalesced">Run with coalescing</button>
+    <button id="direct">Run without coalescing</button>
+    <button id="reset">Reset</button>
+  </div>
+  <p id="message" aria-live="polite">Ready.</p>
+  <section class="cards" aria-label="Current counters">
+    <div class="card">Database loads<span class="value" id="db">0</span></div>
+    <div class="card">Cache hits<span class="value" id="hits">0</span></div>
+    <div class="card">Cache misses<span class="value" id="misses">0</span></div>
+    <div class="card">Coalesced waiters<span class="value" id="waiters">0</span></div>
+    <div class="card">Active repository loads<span class="value" id="active">0</span></div>
+    <div class="card">In-flight loads<span class="value" id="inflight">0</span></div>
+  </section>
+  <section class="chart">
+    <strong>Database loads over time</strong>
+    <canvas id="chart" aria-label="Database loads over time chart"></canvas>
+  </section>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const points = [];
+    const canvas = $('chart');
+    const ctx = canvas.getContext('2d');
+    let running = false;
+    let pollTimer;
+
+    function draw() {
+      const ratio = window.devicePixelRatio || 1;
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      canvas.width = width * ratio;
+      canvas.height = height * ratio;
+      ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      const style = getComputedStyle(document.body);
+      const line = style.color;
+      const pad = { l: 46, r: 12, t: 16, b: 28 };
+      const plotW = width - pad.l - pad.r;
+      const plotH = height - pad.t - pad.b;
+      const max = Math.max(10, ...points.map(p => p.value));
+      ctx.strokeStyle = line + '66';
+      ctx.fillStyle = line;
+      ctx.font = '12px system-ui';
+      for (let i = 0; i <= 4; i++) {
+        const y = pad.t + plotH * i / 4;
+        ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(width - pad.r, y); ctx.stroke();
+        ctx.fillText(String(Math.round(max * (4 - i) / 4)), 4, y + 4);
+      }
+      if (points.length < 2) return;
+      ctx.strokeStyle = '#ef6c35'; ctx.lineWidth = 3; ctx.beginPath();
+      points.forEach((p, i) => {
+        const x = pad.l + plotW * i / Math.max(1, points.length - 1);
+        const y = pad.t + plotH * (1 - p.value / max);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch('/api/demo/stats', { cache: 'no-store' });
+        const s = await response.json();
+        $('db').textContent = s.databaseLoads;
+        $('hits').textContent = s.cacheHits;
+        $('misses').textContent = s.cacheMisses;
+        $('waiters').textContent = s.coalescedWaiters;
+        $('active').textContent = s.activeRepositoryLoads;
+        $('inflight').textContent = s.inFlightLoads;
+        const now = Date.now();
+        if (!points.length || points[points.length - 1].value !== s.databaseLoads) {
+          points.push({ time: now, value: s.databaseLoads });
+          if (points.length > 240) points.shift();
+          draw();
+        }
+      } catch (e) {
+        $('message').textContent = 'Could not read stats: ' + e.message;
+      }
+    }
+
+    async function run(path, label) {
+      if (running) return;
+      running = true;
+      $('coalesced').disabled = $('direct').disabled = $('reset').disabled = true;
+      points.length = 0; draw();
+      $('message').textContent = label + ' burst running…';
+      await refresh();
+      pollTimer = setInterval(refresh, 200);
+      try {
+        const response = await fetch(path, { method: 'POST' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.message || response.statusText);
+        await refresh();
+        $('message').textContent = `${result.mode}: ${result.succeeded}/${result.requested} callers; this run added ${result.runStats.databaseLoads} database loads, ${result.runStats.cacheMisses} cache misses, and ${result.runStats.coalescedWaiters} coalesced waiters (${result.elapsedMs} ms).`;
+      } catch (e) {
+        $('message').textContent = 'Burst failed: ' + e.message;
+      } finally {
+        clearInterval(pollTimer);
+        running = false;
+        $('coalesced').disabled = $('direct').disabled = $('reset').disabled = false;
+      }
+    }
+
+    $('coalesced').onclick = () => run('/api/demo/burst', 'Coalesced');
+    $('direct').onclick = () => run('/api/demo/burst-without-coalescing', 'Direct database');
+    $('fetch').onclick = async () => {
+      $('fetch').disabled = true;
+      try {
+        const response = await fetch('/api/items/product:demo', { cache: 'no-store' });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || response.statusText);
+        $('message').textContent = `Fetched ${result.key}: ${result.value}`;
+        await refresh();
+      } catch (e) {
+        $('message').textContent = 'Fetch failed: ' + e.message;
+      } finally {
+        $('fetch').disabled = false;
+      }
+    };
+    $('reset').onclick = async () => {
+      points.length = 0;
+      await fetch('/api/demo/reset', { method: 'POST' });
+      await refresh();
+      $('message').textContent = 'Counters reset; demo key evicted.';
+    };
+    window.addEventListener('resize', draw);
+    refresh();
+    setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
